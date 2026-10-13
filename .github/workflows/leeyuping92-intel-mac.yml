@@ -1,0 +1,140 @@
+# Keep this fork-specific workflow when merging upstream updates.
+name: Intel Mac Wheels
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intel-mac-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Python 3.12 / macOS 15 / Intel
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      CIBW_ARCHS_MACOS: x86_64
+      CIBW_BUILD: cp312-macosx_x86_64
+      CC: clang
+      CXX: clang++
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify Intel runner and record source
+        run: |
+          test "$(uname -m)" = "x86_64"
+          mkdir -p verification
+          git rev-parse HEAD > verification/source-commit.txt
+          python --version
+          clang++ --version
+
+      - name: Install build prerequisites
+        run: brew install autoconf automake libtool
+
+      - name: Cache vcpkg dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: intel-macos15-vcpkg-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.gitmodules') }}-${{ hashFiles('thirdparty/vcpkg/scripts/vcpkg.version.txt') }}
+          restore-keys: |
+            intel-macos15-vcpkg-
+
+      - name: Build, repair and test wheel
+        uses: pypa/cibuildwheel@v3.3.1
+        env:
+          VCPKG_BINARY_SOURCES: "clear;default,readwrite"
+
+      - name: Install wheel in a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/psapi-verify"
+          "$RUNNER_TEMP/psapi-verify/bin/python" -m pip install wheelhouse/*.whl
+          "$RUNNER_TEMP/psapi-verify/bin/python" -m pip check
+
+      - name: Verify native text and independent backgrounds
+        run: |
+          "$RUNNER_TEMP/psapi-verify/bin/python" - <<'PY'
+          import importlib.metadata
+          from pathlib import Path
+          import platform
+          import subprocess
+
+          import numpy as np
+          import photoshopapi as psapi
+
+          assert platform.machine() == "x86_64"
+          output = Path("verification")
+          version = importlib.metadata.version("PhotoshopAPI")
+          (output / "version.txt").write_text(version + "\n")
+          binaries = list(Path(psapi.__file__).parent.rglob("*.so"))
+          assert binaries, "Wheel has no native extension"
+          for binary in binaries:
+              assert subprocess.check_output(["lipo", "-archs", str(binary)], text=True).strip() == "x86_64"
+
+          text = "你好 Intel Mac\nEditable PSD"
+          document = psapi.LayeredFile_8bit(psapi.enum.ColorMode.rgb, 320, 160)
+          document.dpi = 72
+          words = psapi.GroupLayer_8bit("文字")
+          backgrounds = psapi.GroupLayer_8bit("背景")
+          document.add_layer(words)
+          document.add_layer(backgrounds)
+          layer = psapi.TextLayer_8bit(
+              layer_name="Editable text", text=text, font="PingFangSC-Regular",
+              font_size=24.0, fill_color=[1.0, 0.1, 0.2, 0.3],
+              position_x=16.0, position_y=40.0, box_width=0.0, box_height=0.0,
+          )
+          layer.convert_to_point_text()
+          layer.split_paragraph_run(0, len(text.split("\n")[0].encode("utf-16-le")) // 2 + 1)
+          font = layer.add_font("PingFangSC-Regular", psapi.enum.FontType.OpenType, psapi.enum.FontScript.CJK)
+          assert font >= 0
+          layer.set_style_normal_font(font)
+          for index in range(layer.style_run_count):
+              layer.set_style_run_font(index, font)
+          style = layer.style_all()
+          style.set_font_size(24.0)
+          style.set_auto_leading(False)
+          style.set_leading(30.0)
+          layer.fill = 1.0
+          words.add_layer(document, layer)
+          background = psapi.ImageLayer_8bit(
+              np.full((3, 100, 300), 255, dtype=np.uint8), "Box background",
+              width=300, height=100, pos_x=160, pos_y=60,
+          )
+          background.opacity = 0.5
+          backgrounds.add_layer(document, background)
+          document.add_layer(psapi.ImageLayer_8bit(
+              np.full((3, 160, 320), 240, dtype=np.uint8), "Original",
+              width=320, height=160, pos_x=160, pos_y=80,
+          ))
+          document.write(str(output / "intel-text-smoke.psd"))
+          restored = psapi.LayeredFile.read(str(output / "intel-text-smoke.psd"))
+          restored_words = [item for item in restored.flat_layers if isinstance(item, psapi.TextLayer_8bit)]
+          assert len(restored_words) == 1
+          assert restored_words[0].text.replace("\r", "\n").rstrip("\n") == text
+          restored_background = next(item for item in restored.flat_layers if item.name == "Box background")
+          assert abs(restored_background.opacity - 0.5) < 0.01
+          print(f"PhotoshopAPI {version}: Intel wheel and editable Chinese PSD roundtrip passed")
+          PY
+
+      - name: Upload verified wheel and sample PSD
+        uses: actions/upload-artifact@v4
+        with:
+          name: photoshopapi-intel-macos15-cp312-${{ github.sha }}
+          path: |
+            wheelhouse/*.whl
+            verification/
+          if-no-files-found: error
