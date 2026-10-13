@@ -45,20 +45,33 @@ jobs:
           clang++ --version
 
       - name: Install build prerequisites
-        run: brew install autoconf automake libtool
+        run: |
+          brew install autoconf automake libtool
+          # Intel Homebrew headers in /usr/local/include override vcpkg's JPEG ABI.
+          if brew list --formula jpeg-turbo >/dev/null 2>&1; then
+            brew unlink jpeg-turbo
+          fi
 
       - name: Cache vcpkg dependencies
-        uses: actions/cache@v4
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/vcpkg/archives
-          key: intel-macos15-vcpkg-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.gitmodules') }}-${{ hashFiles('thirdparty/vcpkg/scripts/vcpkg.version.txt') }}
+          key: intel-macos15-vcpkg-no-brew-jpeg-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.gitmodules') }}-${{ hashFiles('thirdparty/vcpkg/scripts/vcpkg.version.txt') }}
           restore-keys: |
-            intel-macos15-vcpkg-
+            intel-macos15-vcpkg-no-brew-jpeg-
 
       - name: Build, repair and test wheel
         uses: pypa/cibuildwheel@v3.3.1
         env:
           VCPKG_BINARY_SOURCES: "clear;default,readwrite"
+
+      - name: Save compiled dependencies even if wheel tests fail
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Install wheel in a clean environment
         run: |
